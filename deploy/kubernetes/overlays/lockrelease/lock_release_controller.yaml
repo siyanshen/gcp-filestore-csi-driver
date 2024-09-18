@@ -21,14 +21,14 @@ spec:
         kubernetes.io/os: linux
       containers:
       - name: filestore-lock-release-controller
-        image: 'gcr.io/shensiyan-joonix/gcp-filestore-csi-driver-lockrelease:18'
+        image: 'gcr.io/shensiyan-joonix/gcp-filestore-csi-driver-lockrelease:23'
         args:
-        - --v=6
+        - --v=5
         resources:                                               
           requests:                                              
             cpu: 5m                                              
             memory: 10Mi                                         
-      serviceAccountName: gcp-filestore-csi-node-sa    # To be created in fscsi_lock_release_rbac.yaml
+      serviceAccountName: filestore-lockrelease-controller-sa
       tolerations:
       - key: "kubernetes.io/arch"
         operator: "Equal"

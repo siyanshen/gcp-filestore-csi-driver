@@ -19,10 +19,16 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/metrics"
 	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/util"
@@ -37,6 +43,11 @@ const (
 	rootCA = "kube-root-ca.crt"
 )
 
+type NodeUpdatePair struct {
+	OldObj *corev1.Node
+	NewObj *corev1.Node
+}
+
 type LockReleaseController struct {
 	client kubernetes.Interface
 
@@ -49,6 +60,9 @@ type LockReleaseController struct {
 	config         *LockReleaseControllerConfig
 	metricsManager *metrics.MetricsManager
 	nodeInformer   *cache.SharedIndexInformer
+
+	updateEventQueue workqueue.RateLimitingInterface
+	createEventQueue workqueue.RateLimitingInterface
 }
 
 type LockReleaseControllerConfig struct {
@@ -77,13 +91,19 @@ func NewLockReleaseController(
 	}
 	// Add a uniquifier so that two processes on the same host don't accidentally both become active.
 	id := hostname + "_" + string(uuid.NewUUID())
+	ratelimiter := workqueue.NewMaxOfRateLimiter(
+		workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
+		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
+	)
 
 	lc := &LockReleaseController{
-		id:           id,
-		hostname:     hostname,
-		client:       client,
-		config:       config,
-		nodeInformer: nodeInformer,
+		id:               id,
+		hostname:         hostname,
+		client:           client,
+		config:           config,
+		nodeInformer:     nodeInformer,
+		updateEventQueue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		createEventQueue: workqueue.NewRateLimitingQueue(ratelimiter),
 	}
 
 	if config.MetricEndpoint != "" {
@@ -97,7 +117,31 @@ func NewLockReleaseController(
 	return lc, nil
 }
 
-func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *corev1.Node) error {
+func (c *LockReleaseController) Run(ctx context.Context) error {
+	defer utilruntime.HandleCrash()
+	defer c.updateEventQueue.ShutDown()
+	defer c.createEventQueue.ShutDown()
+	klog.Infof("Lock release controller %s started leading on node %s", c.GetId(), c.GetHost())
+	if !cache.WaitForCacheSync(ctx.Done(), (*c.nodeInformer).HasSynced) {
+		klog.Fatal("Timed out waiting for caches to sync")
+		return fmt.Errorf("failed to wait for caches to sync")
+	}
+	klog.Info("Cache sync completed successfully.")
+	go wait.UntilWithContext(ctx, c.runCreateEventWorker, time.Second)
+	go wait.UntilWithContext(ctx, c.runUpdateEventWorker, time.Second)
+	klog.Info("Started workers")
+	<-ctx.Done()
+	klog.Info("Shutting down workers")
+	return nil
+}
+
+func (c *LockReleaseController) runCreateEventWorker(ctx context.Context) {
+	for c.processNextCreateEvent(ctx) {
+	}
+}
+
+func (c *LockReleaseController) handleCreateEvent(ctx context.Context, obj interface{}) error {
+	node := obj.(*corev1.Node)
 	start := time.Now()
 	cmName := ConfigMapNamePrefix + node.Name
 	cm, err := c.client.CoreV1().ConfigMaps(util.ManagedFilestoreCSINamespace).Get(ctx, cmName, metav1.GetOptions{})
@@ -106,7 +150,7 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 
 	if err != nil {
 		klog.Errorf("Failed to get configmap in namespace %s: %v", util.ManagedFilestoreCSINamespace, err)
-		return err
+		return nil
 	}
 	klog.Infof("Got configmap (%v) in namespace %s", cm, util.ManagedFilestoreCSINamespace)
 	data := cm.DeepCopy().Data
@@ -115,6 +159,8 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 		klog.Errorf("Failed to get node in namespace %v", err)
 		return err
 	}
+
+	skippedEntry := false
 
 	for key, filestoreIP := range data {
 		_, _, _, _, gceInstanceID, gkeNodeInternalIP, err := ParseConfigMapKey(key)
@@ -126,6 +172,7 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 		entryMatchesNode, err := c.verifyConfigMapEntry(node, gceInstanceID, gkeNodeInternalIP)
 		if err != nil {
 			klog.Errorf("Failed to verify GKE node %s with nodeId %s nodeInternalIP %s still exists: %v", node.Name, gceInstanceID, gkeNodeInternalIP, err)
+			skippedEntry = true
 			continue
 		}
 		if entryMatchesNode {
@@ -137,6 +184,7 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 		entryMatchesLatestNode, err := c.verifyConfigMapEntry(latestNode, gceInstanceID, gkeNodeInternalIP)
 		if err != nil {
 			klog.Errorf("Failed to verify GKE node %s with nodeId %s nodeInternalIP %s still exists: %v", node.Name, gceInstanceID, gkeNodeInternalIP, err)
+			skippedEntry = true
 			continue
 		}
 		if entryMatchesLatestNode {
@@ -149,6 +197,7 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 		c.RecordLockReleaseMetrics(opErr)
 		if opErr != nil {
 			klog.Errorf("Failed to release lock: %v", opErr)
+			skippedEntry = true
 			continue
 		}
 		klog.Infof("Removing lock info key %s from configmap %s/%s with data %v", key, cm.Namespace, cm.Name, cm.Data)
@@ -156,13 +205,77 @@ func (c *LockReleaseController) HandleCreateEvent(ctx context.Context, node *cor
 		// This will increase the number of k8s api calls,
 		// but reduce repetitive ReleaseLock() due to kubeclient api failures in each reconcile loop.
 		if err := c.RemoveKeyFromConfigMapWithRetry(ctx, cm, key); err != nil {
+			skippedEntry = true
 			klog.Errorf("Failed to remove key %s from configmap %s/%s: %v", key, cm.Namespace, cm.Name, err)
 		}
 	}
+	if skippedEntry {
+		return fmt.Errorf("skipped one or more entries in the config map; will process this event again later")
+	}
 	return nil
+
 }
 
-func (c *LockReleaseController) HandleUpdateEvent(ctx context.Context, oldNode *corev1.Node, newNode *corev1.Node) error {
+func (c *LockReleaseController) processNextCreateEvent(ctx context.Context) bool {
+	obj, shutdown := c.createEventQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer c.createEventQueue.Done(obj)
+
+	err := c.handleCreateEvent(ctx, obj)
+	if err == nil {
+		// If no error occurs then we Forget this item so it does not
+		// get queued again until another change happens.
+		c.createEventQueue.Forget(obj)
+		klog.Infof("Successfully processed node create event object %v", obj)
+		return true
+	}
+
+	klog.Errorf("Requeue node create event due to error: %v", err)
+	c.createEventQueue.AddRateLimited(obj)
+	return true
+
+}
+
+func (c *LockReleaseController) runUpdateEventWorker(ctx context.Context) {
+	for c.processNextUpdateEventWorkItem(ctx) {
+	}
+}
+
+func (c *LockReleaseController) processNextUpdateEventWorkItem(ctx context.Context) bool {
+	obj, shutdown := c.updateEventQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer c.updateEventQueue.Done(obj)
+	nodeUpdatePair, ok := obj.(*NodeUpdatePair)
+	if !ok {
+		klog.Error("unable to convert update event object to nodeUpdatePair")
+		return true
+	}
+
+	// Access old and new objects:
+	oldObj := nodeUpdatePair.OldObj
+	newObj := nodeUpdatePair.NewObj
+
+	err := c.handleUpdateEvent(ctx, oldObj, newObj)
+	if err == nil {
+		// If no error occurs then we Forget this item so it does not
+		// get queued again until another change happens.
+		c.updateEventQueue.Forget(obj)
+		klog.Infof("Successfully processed node update event object %v", obj)
+		return true
+	}
+
+	klog.Errorf("Requeue node update event due to error: %v", err)
+	c.updateEventQueue.AddRateLimited(obj)
+	return true
+}
+
+func (c *LockReleaseController) handleUpdateEvent(ctx context.Context, oldObj interface{}, newObj interface{}) error {
+	newNode := newObj.(*corev1.Node)
+	oldNode := oldObj.(*corev1.Node)
 	start := time.Now()
 	nodeName := newNode.Name
 	cmName := ConfigMapNamePrefix + nodeName
@@ -172,47 +285,57 @@ func (c *LockReleaseController) HandleUpdateEvent(ctx context.Context, oldNode *
 
 	if err != nil {
 		klog.Errorf("Failed to get configmap in namespace %s: %v", util.ManagedFilestoreCSINamespace, err)
-		return err
+		return nil
 	}
 	klog.Infof("Got configmap (%v) in namespace %s", cm, util.ManagedFilestoreCSINamespace)
 
 	data := cm.DeepCopy().Data
+	skippedEntry := false
 	for key, filestoreIP := range data {
 		_, _, _, _, gceInstanceID, gkeNodeInternalIP, err := ParseConfigMapKey(key)
 		if err != nil {
 			klog.Errorf("Failed to parse configmap key %s: %v", key, err)
+			skippedEntry = true
 			continue
 		}
 		klog.V(6).Infof("Verifying GKE node %s with nodeId %s nodeInternalIP %s exists or not", nodeName, gceInstanceID, gkeNodeInternalIP)
 		entryMatchesNewNode, err := c.verifyConfigMapEntry(newNode, gceInstanceID, gkeNodeInternalIP)
 		if err != nil {
 			klog.Errorf("Failed to verify GKE node %s with nodeId %s nodeInternalIP %s still exists: %v", nodeName, gceInstanceID, gkeNodeInternalIP, err)
+			skippedEntry = true
 			continue
 		}
 		entryMatchesOldNode, err := c.verifyConfigMapEntry(oldNode, gceInstanceID, gkeNodeInternalIP)
 		if err != nil {
 			klog.Errorf("Failed to verify GKE node %s with nodeId %s nodeInternalIP %s still exists: %v", nodeName, gceInstanceID, gkeNodeInternalIP, err)
+			skippedEntry = true
 			continue
 		}
 		klog.Infof("Checked config map entry against old node(matching result %t), and new node(matching result %t)", entryMatchesOldNode, entryMatchesNewNode)
 		if entryMatchesNewNode {
 			klog.V(6).Infof("GKE node %s with nodeId %s nodeInternalIP %s still exists in API server, skip lock info reconciliation", nodeName, gceInstanceID, gkeNodeInternalIP)
 			continue
-		} else if entryMatchesOldNode {
+		}
+		if entryMatchesOldNode {
 			klog.Infof("GKE node %s with nodeId %s nodeInternalIP %s matches a node before update, releasing lock for Filestore IP %s", nodeName, gceInstanceID, gkeNodeInternalIP, filestoreIP)
 			opErr := ReleaseLock(filestoreIP, gkeNodeInternalIP)
 			c.RecordLockReleaseMetrics(opErr)
 			if opErr != nil {
 				klog.Errorf("Failed to release lock: %v", opErr)
+				skippedEntry = true
 				continue
 			}
 			klog.Infof("Removing lock info key %s from configmap %s/%s with data %v", key, cm.Namespace, cm.Name, cm.Data)
 
 			if err := c.RemoveKeyFromConfigMapWithRetry(ctx, cm, key); err != nil {
+				skippedEntry = true
 				klog.Errorf("Failed to remove key %s from configmap %s/%s: %v", key, cm.Namespace, cm.Name, err)
 			}
 		}
 
+	}
+	if skippedEntry {
+		return fmt.Errorf("skipped one or more entries in the config map; will process this event again later")
 	}
 	return nil
 }
@@ -239,18 +362,6 @@ func (c *LockReleaseController) verifyConfigMapEntry(node *corev1.Node, expected
 		}
 	}
 	return false, nil
-}
-
-func (c *LockReleaseController) ListNodes(ctx context.Context) (map[string]*corev1.Node, error) {
-	nodeList, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	nodeMap := map[string]*corev1.Node{}
-	for _, node := range nodeList.Items {
-		nodeMap[node.Name] = node.DeepCopy()
-	}
-	return nodeMap, nil
 }
 
 func (c *LockReleaseController) RecordKubeAPIMetrics(opErr error, resourceType, opType, opSource string, opDuration time.Duration) {
@@ -280,4 +391,18 @@ func (c *LockReleaseController) GetHost() string {
 // GetClient returns the kubernetes client of the LockReleaseController.
 func (c *LockReleaseController) GetClient() kubernetes.Interface {
 	return c.client
+}
+
+// EnqueueCreateEvent adds an object to the createEventQueue of the LockReleaseController.
+func (c *LockReleaseController) EnqueueCreateEventObject(obj interface{}) {
+	c.createEventQueue.Add(obj)
+}
+
+// EnqueueUpdateEvent adds a NodeUpdatePair to the updateEventQueue.
+func (c *LockReleaseController) EnqueueUpdateEventObject(oldObj, newObj interface{}) {
+	nodeUpdatePair := &NodeUpdatePair{
+		OldObj: oldObj.(*corev1.Node), // Type assertion to *v1.Node
+		NewObj: newObj.(*corev1.Node), // Type assertion to *v1.Node
+	}
+	c.updateEventQueue.Add(nodeUpdatePair)
 }

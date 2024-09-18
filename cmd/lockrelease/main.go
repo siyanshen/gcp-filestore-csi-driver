@@ -18,16 +18,12 @@ import (
 	"flag"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	// "sigs.k8s.io/gcp-filestore-csi-driver/pkg/metrics"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	releaselock "sigs.k8s.io/gcp-filestore-csi-driver/pkg/releaselock"
@@ -84,28 +80,18 @@ func main() {
 	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			klog.Infof("Node informer received node create event. %v", obj)
-			node := obj.(*corev1.Node)
-			c.HandleCreateEvent(ctx, node)
+			c.EnqueueCreateEventObject(obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			klog.Infof("Node informer received node update event. old %v, new %v", oldObj, newObj)
-			newNode := newObj.(*corev1.Node)
-			oldNode := oldObj.(*corev1.Node)
-			c.HandleUpdateEvent(ctx, oldNode, newNode)
+			c.EnqueueUpdateEventObject(oldObj, newObj)
 		},
 	})
 
 	run := func(ctx context.Context) {
 		klog.Infof("Lock release controller %s started leading on node %s", c.GetId(), c.GetHost())
-
 		factory.Start(ctx.Done())
-
-		if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced) {
-			klog.Error("Timed out waiting for caches to sync")
-			return
-		}
-
-		klog.Info("Cache sync completed successfully.")
+		c.Run(ctx)
 	}
 
 	rl, err := resourcelock.New(
